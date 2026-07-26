@@ -38,9 +38,6 @@
     },
     "plugins": [
       [
-        "./plugins/withHideApp"
-      ],
-      [
         "expo-notifications",
         {
           "icon": "./assets/icon.png",
