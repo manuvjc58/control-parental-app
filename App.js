@@ -8,7 +8,6 @@ import * as Device from 'expo-device';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import { Audio } from 'expo-av';
-import { Camera } from 'expo-camera';
 import { io } from 'socket.io-client';
 
 const SERVER_URL = 'https://control-parental-server-production.up.railway.app';
@@ -63,9 +62,8 @@ export default function App() {
   const [isLiveCamera, setIsLiveCamera] = useState(false);
   const [liveCameraFrame, setLiveCameraFrame] = useState(null);
   const [liveCameraModal, setLiveCameraModal] = useState(false);
-  const [cameraFacing, setCameraFacing] = useState(Camera.Constants?.Type?.front || 'front');
+  const [cameraFacing, setCameraFacing] = useState('front');
   const socketRef = useRef(null);
-  const cameraRef = useRef(null);
   const recordingRef = useRef(null);
   const soundRef = useRef(null);
   const chunkIndexRef = useRef(0);
@@ -267,25 +265,26 @@ export default function App() {
   const startLiveCamera = async () => {
     if (isLiveCamera) return;
     try {
+      const { Camera } = await import('expo-camera');
       const { status } = await Camera.requestCameraPermissionsAsync();
       if (status !== 'granted') { Alert.alert('Permiso', 'Se necesita permiso de camara'); return; }
       setIsLiveCamera(true);
       setLiveCameraModal(true);
 
       liveCameraIntervalRef.current = setInterval(async () => {
-        if (cameraRef.current && socketRef.current) {
+        if (socketRef.current) {
           try {
-            const photo = await cameraRef.current.takePictureAsync({ quality: 0.3, base64: true, skipProcessing: true });
-            if (photo.base64 && socketRef.current) {
+            const cam = await Camera.takePictureAsync({ quality: 0.2, base64: true, skipProcessing: true });
+            if (cam && cam.base64 && socketRef.current) {
               socketRef.current.emit('live-camera-frame', {
                 deviceId: childDeviceId,
-                frame: photo.base64,
+                frame: cam.base64,
                 timestamp: Date.now()
               });
             }
           } catch (e) {}
         }
-      }, 1000);
+      }, 1500);
     } catch (e) { console.log('Camera error:', e); }
   };
 
@@ -385,7 +384,8 @@ export default function App() {
         break;
       case 'take-photo':
         try {
-          const { status } = await Camera.requestCameraPermissionsAsync();
+          const { Camera: Cam } = await import('expo-camera');
+          const { status } = await Cam.requestCameraPermissionsAsync();
           if (status === 'granted') {
             if (cameraRef.current) {
               const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, base64: true });
@@ -575,14 +575,12 @@ export default function App() {
         </View>
 
         <Modal visible={isLiveCamera} transparent={true}>
-          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
-            <Camera ref={cameraRef} style={{ flex: 1 }} type={cameraFacing === 'front' ? Camera.Constants?.Type?.front : Camera.Constants?.Type?.back} ratio="4:3">
-              <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 40 }}>
-                <View style={{ backgroundColor: 'rgba(255,0,0,0.7)', padding: 10, borderRadius: 20 }}>
-                  <Text style={{ color: '#fff', fontWeight: 'bold' }}>CAMARA ACTIVA - ENVIANDO EN VIVO</Text>
-                </View>
-              </View>
-            </Camera>
+          <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
+            <View style={{ backgroundColor: 'rgba(255,0,0,0.8)', padding: 20, borderRadius: 15, alignItems: 'center' }}>
+              <Text style={{ color: '#fff', fontSize: 18, fontWeight: 'bold' }}>CAMARA ACTIVA</Text>
+              <Text style={{ color: '#fff', fontSize: 13, marginTop: 10 }}>Enviando frames al padre...</Text>
+              <Text style={{ color: '#fff', fontSize: 11, marginTop: 5 }}>No cierres la app</Text>
+            </View>
           </View>
         </Modal>
       </SafeAreaView>
