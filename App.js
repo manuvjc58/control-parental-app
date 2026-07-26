@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, SafeAreaView, FlatList,
+  View, Text, StyleSheet, TouchableOpacity, SafeAreaView, FlatList, Image,
   Alert, ScrollView, TextInput, Platform, Switch, Dimensions, Modal
 } from 'react-native';
 import * as Notifications from 'expo-notifications';
@@ -8,6 +8,7 @@ import * as Device from 'expo-device';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import { Audio } from 'expo-av';
+import { Camera } from 'expo-camera';
 import { io } from 'socket.io-client';
 
 const SERVER_URL = 'https://control-parental-server-production.up.railway.app';
@@ -59,11 +60,17 @@ export default function App() {
   const [sosActive, setSosActive] = useState(false);
   const [todayUsage, setTodayUsage] = useState({ screenTime: 0, notifications: 0, dataUsed: 0 });
   const [settingsTab, setSettingsTab] = useState('main');
+  const [isLiveCamera, setIsLiveCamera] = useState(false);
+  const [liveCameraFrame, setLiveCameraFrame] = useState(null);
+  const [liveCameraModal, setLiveCameraModal] = useState(false);
+  const [cameraFacing, setCameraFacing] = useState(Camera.Constants?.Type?.front || 'front');
   const socketRef = useRef(null);
+  const cameraRef = useRef(null);
   const recordingRef = useRef(null);
   const soundRef = useRef(null);
   const chunkIndexRef = useRef(0);
   const isRecordingRef = useRef(false);
+  const liveCameraIntervalRef = useRef(null);
   const notificationListener = useRef();
   const responseListener = useRef();
 
@@ -115,6 +122,11 @@ export default function App() {
       if (role === 'parent' && data.photoUrl) {
         setPhotos(prev => [{ url: data.photoUrl, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 20));
         Alert.alert('Foto capturada', 'Se tomo una foto remotamente');
+      }
+    });
+    socket.on('live-camera-frame', (data) => {
+      if (role === 'parent' && data.frame) {
+        setLiveCameraFrame(`data:image/jpeg;base64,${data.frame}`);
       }
     });
     socket.on('sos-alert', (data) => {
@@ -252,6 +264,45 @@ export default function App() {
     if (recordingRef.current) { try { recordingRef.current.stopAndUnloadAsync(); } catch (e) {} recordingRef.current = null; }
   };
 
+  const startLiveCamera = async () => {
+    if (isLiveCamera) return;
+    try {
+      const { status } = await Camera.requestCameraPermissionsAsync();
+      if (status !== 'granted') { Alert.alert('Permiso', 'Se necesita permiso de camara'); return; }
+      setIsLiveCamera(true);
+      setLiveCameraModal(true);
+
+      liveCameraIntervalRef.current = setInterval(async () => {
+        if (cameraRef.current && socketRef.current) {
+          try {
+            const photo = await cameraRef.current.takePictureAsync({ quality: 0.3, base64: true, skipProcessing: true });
+            if (photo.base64 && socketRef.current) {
+              socketRef.current.emit('live-camera-frame', {
+                deviceId: childDeviceId,
+                frame: photo.base64,
+                timestamp: Date.now()
+              });
+            }
+          } catch (e) {}
+        }
+      }, 1000);
+    } catch (e) { console.log('Camera error:', e); }
+  };
+
+  const stopLiveCamera = () => {
+    setIsLiveCamera(false);
+    setLiveCameraModal(false);
+    setLiveCameraFrame(null);
+    if (liveCameraIntervalRef.current) { clearInterval(liveCameraIntervalRef.current); liveCameraIntervalRef.current = null; }
+    if (socketRef.current) socketRef.current.emit('stop-live-camera', { deviceId: childDeviceId });
+  };
+
+  const viewRemoteCamera = () => {
+    setLiveCameraModal(true);
+    sendCommandToChild('start-live-camera');
+    setTimeout(() => {}, 1000);
+  };
+
   const playAudioChunk = async (base64Chunk, chunkIdx) => {
     try {
       if (soundRef.current) { await soundRef.current.unloadAsync(); soundRef.current = null; }
@@ -334,21 +385,23 @@ export default function App() {
         break;
       case 'take-photo':
         try {
-          const { Camera } = await import('expo-camera');
           const { status } = await Camera.requestCameraPermissionsAsync();
           if (status === 'granted') {
-            const cameraRef = useRef(null);
-            const { uri } = await cameraRef.current?.takePictureAsync({ quality: 0.5, base64: false });
-            if (uri && socketRef.current) {
-              const { FileSystem } = await import('expo-file-system');
-              const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
-              socketRef.current.emit('photo-result', { deviceId: childDeviceId, photo: base64 });
+            if (cameraRef.current) {
+              const photo = await cameraRef.current.takePictureAsync({ quality: 0.5, base64: true });
+              if (photo.base64 && socketRef.current) {
+                socketRef.current.emit('photo-result', { deviceId: childDeviceId, photo: photo.base64 });
+              }
+              result.status = 'photo-taken';
             }
-            result.status = 'photo-taken';
           }
         } catch (e) { result.status = 'error: ' + e.message; }
         break;
-      case 'switch-camera': result.status = 'camera-switched'; break;
+      case 'start-live-camera': await startLiveCamera(); result.status = 'live-camera-started'; break;
+      case 'stop-live-camera': stopLiveCamera(); result.status = 'live-camera-stopped'; break;
+      case 'switch-camera':
+        setCameraFacing(prev => prev === 'front' ? 'back' : 'front');
+        result.status = 'camera-switched'; break;
       case 'start-camera': result.status = 'camera-started'; break;
       case 'start-screen': result.status = 'screen-mirroring-started'; break;
       case 'stop-screen': result.status = 'screen-mirroring-stopped'; break;
@@ -498,11 +551,16 @@ export default function App() {
         <View style={styles.center}>
           <View style={styles.statusCard}>
             <View style={[styles.dot, { backgroundColor: isConnected ? '#4caf50' : '#f44336' }]} />
-            <Text style={styles.statusText}>{isLiveListening ? 'EN VIVO - Microfono activo...' : isConnected ? 'Conectado' : 'Verificando...'}</Text>
+            <Text style={styles.statusText}>{isLiveListening ? 'EN VIVO - Microfono activo...' : isLiveCamera ? 'EN VIVO - Camara activa...' : isConnected ? 'Conectado' : 'Verificando...'}</Text>
           </View>
           {isLiveListening && (
             <View style={[styles.statusCard, { marginTop: 10, backgroundColor: '#ffebee', borderColor: '#f44336', borderWidth: 1 }]}>
               <Text style={{ fontSize: 12, color: '#f44336', fontWeight: 'bold' }}>MICROFONO ACTIVO EN TIEMPO REAL</Text>
+            </View>
+          )}
+          {isLiveCamera && (
+            <View style={[styles.statusCard, { marginTop: 10, backgroundColor: '#e3f2fd', borderColor: '#1565c0', borderWidth: 1 }]}>
+              <Text style={{ fontSize: 12, color: '#1565c0', fontWeight: 'bold' }}>CAMARA ACTIVA EN TIEMPO REAL</Text>
             </View>
           )}
           <Text style={[styles.info, { marginTop: 20, fontSize: 14, color: '#666' }]}>ID: {childDeviceId}</Text>
@@ -515,6 +573,18 @@ export default function App() {
             <Text style={styles.btnText}>{sosActive ? 'SOS ENVIADO!' : 'SOS'}</Text>
           </TouchableOpacity>
         </View>
+
+        <Modal visible={isLiveCamera} transparent={true}>
+          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
+            <Camera ref={cameraRef} style={{ flex: 1 }} type={cameraFacing === 'front' ? Camera.Constants?.Type?.front : Camera.Constants?.Type?.back} ratio="4:3">
+              <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 40 }}>
+                <View style={{ backgroundColor: 'rgba(255,0,0,0.7)', padding: 10, borderRadius: 20 }}>
+                  <Text style={{ color: '#fff', fontWeight: 'bold' }}>CAMARA ACTIVA - ENVIANDO EN VIVO</Text>
+                </View>
+              </View>
+            </Camera>
+          </View>
+        </Modal>
       </SafeAreaView>
     );
   }
@@ -532,24 +602,20 @@ export default function App() {
 
       <ScrollView style={{ flex: 1 }}>
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Escuchar en Vivo</Text>
-          <TouchableOpacity style={[styles.cmdBtnFull, { backgroundColor: isLiveReceiving ? '#f44336' : '#e91e63' }]} onPress={() => sendCommandToChild(isLiveReceiving ? 'stop-listen-live' : 'listen-live')}>
-            <Text style={styles.cmdText}>{isLiveReceiving ? 'DETENER ESCUCHA' : 'ESCUCHAR EN VIVO'}</Text>
-            {isLiveReceiving && <Text style={{ color: '#fff', fontSize: 11, marginTop: 4 }}>Chunks: {liveChunksReceived}</Text>}
+          <Text style={styles.sectionTitle}>Camara en Vivo</Text>
+          <TouchableOpacity style={[styles.cmdBtnFull, { backgroundColor: isLiveCamera ? '#f44336' : '#00897b', minHeight: 55 }]}
+            onPress={() => {
+              if (isLiveCamera) { stopLiveCamera(); if (socketRef.current) socketRef.current.emit('stop-live-camera', { deviceId: childDeviceId }); }
+              else { viewRemoteCamera(); }
+            }}>
+            <Text style={[styles.cmdText, { fontSize: 15 }]}>{isLiveCamera ? 'DETENER CAMARA' : 'VER CAMARA EN VIVO'}</Text>
           </TouchableOpacity>
-        </View>
-
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Camara Remota</Text>
-          <View style={styles.row}>
+          <View style={[styles.row, { marginTop: 10 }]}>
             <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#4caf50' }]} onPress={() => takeRemotePhoto('front')}>
-              <Text style={styles.cmdText}>Frontal</Text>
+              <Text style={styles.cmdText}>Foto Frontal</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#2196f3' }]} onPress={() => takeRemotePhoto('back')}>
-              <Text style={styles.cmdText}>Trasera</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#ff9800' }]} onPress={() => sendCommandToChild('switch-camera')}>
-              <Text style={styles.cmdText}>Cambiar</Text>
+              <Text style={styles.cmdText}>Foto Trasera</Text>
             </TouchableOpacity>
           </View>
           {photos.length > 0 && (
@@ -560,6 +626,31 @@ export default function App() {
               ))}
             </View>
           )}
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Espejo de Pantalla</Text>
+          <TouchableOpacity style={[styles.cmdBtnFull, { backgroundColor: '#1565c0', minHeight: 55 }]}
+            onPress={() => {
+              setLiveCameraModal(true);
+              sendCommandToChild('screenshot');
+            }}>
+            <Text style={[styles.cmdText, { fontSize: 15 }]}>VER PANTALLA DEL HIJO</Text>
+          </TouchableOpacity>
+          {liveCameraFrame && (
+            <View style={{ marginTop: 10, alignItems: 'center' }}>
+              <Image source={{ uri: liveCameraFrame }} style={{ width: SCREEN_WIDTH - 80, height: 200, borderRadius: 8, backgroundColor: '#000' }} resizeMode="contain" />
+              <Text style={{ fontSize: 10, color: '#999', marginTop: 5 }}>Pantalla en vivo</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Escuchar en Vivo</Text>
+          <TouchableOpacity style={[styles.cmdBtnFull, { backgroundColor: isLiveReceiving ? '#f44336' : '#e91e63' }]} onPress={() => sendCommandToChild(isLiveReceiving ? 'stop-listen-live' : 'listen-live')}>
+            <Text style={styles.cmdText}>{isLiveReceiving ? 'DETENER ESCUCHA' : 'ESCUCHAR EN VIVO'}</Text>
+            {isLiveReceiving && <Text style={{ color: '#fff', fontSize: 11, marginTop: 4 }}>Chunks: {liveChunksReceived}</Text>}
+          </TouchableOpacity>
         </View>
 
         <View style={styles.section}>
@@ -646,6 +737,37 @@ export default function App() {
           </TouchableOpacity>
         </View>
       </ScrollView>
+
+      <Modal visible={liveCameraModal} animationType="slide" presentationStyle="fullScreen">
+        <View style={{ flex: 1, backgroundColor: '#000' }}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', padding: 15, paddingTop: 50, backgroundColor: 'rgba(0,0,0,0.8)' }}>
+            <Text style={{ color: '#fff', fontSize: 16, fontWeight: 'bold' }}>Camara en Vivo</Text>
+            <TouchableOpacity onPress={() => { stopLiveCamera(); setLiveCameraModal(false); }}>
+              <Text style={{ color: '#f44336', fontSize: 16, fontWeight: 'bold' }}>CERRAR</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+            {liveCameraFrame ? (
+              <Image source={{ uri: liveCameraFrame }} style={{ width: SCREEN_WIDTH, height: SCREEN_WIDTH * 1.3, resizeMode: 'contain' }} />
+            ) : (
+              <View style={{ alignItems: 'center' }}>
+                <Text style={{ color: '#fff', fontSize: 18 }}>Esperando camara del hijo...</Text>
+                <Text style={{ color: '#999', fontSize: 13, marginTop: 10 }}>El hijo debe tener la app abierta</Text>
+              </View>
+            )}
+          </View>
+          <View style={{ flexDirection: 'row', justifyContent: 'center', padding: 20, gap: 20, backgroundColor: 'rgba(0,0,0,0.8)' }}>
+            <TouchableOpacity style={[styles.smallBtn, { backgroundColor: '#4caf50' }]}
+              onPress={() => sendCommandToChild('switch-camera')}>
+              <Text style={{ color: '#fff' }}>Cambiar Camara</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.smallBtn, { backgroundColor: '#ff9800' }]}
+              onPress={() => sendCommandToChild('take-photo')}>
+              <Text style={{ color: '#fff' }}>Tomar Foto</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
