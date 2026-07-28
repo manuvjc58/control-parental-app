@@ -7,12 +7,8 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "assetBundlePatterns": [
-      "**/*"
-    ],
-    "ios": {
-      "supportsTablet": true
-    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": { "supportsTablet": true },
     "android": {
       "package": "com.parentalcontrol.app",
       "adaptiveIcon": {
@@ -21,34 +17,11 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "permissions": [
-        "CAMERA",
-        "RECORD_AUDIO",
-        "ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION",
-        "INTERNET",
-        "RECEIVE_BOOT_COMPLETED",
-        "VIBRATE",
-        "WAKE_LOCK",
-        "FOREGROUND_SERVICE"
-      ]
+      "permissions": ["INTERNET"]
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    },
-    "plugins": [
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/icon.png",
-          "color": "#ffffff"
-        }
-      ]
-    ],
+    "web": { "favicon": "./assets/favicon.png" },
     "extra": {
-      "eas": {
-        "projectId": "273adf6e-691b-4e00-901c-404aa1fdfc43"
-      }
+      "eas": { "projectId": "273adf6e-691b-4e00-901c-404aa1fdfc43" }
     }
   }
 }
